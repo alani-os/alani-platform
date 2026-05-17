@@ -2,13 +2,15 @@
 
 use crate::{
     arch::Architecture, validate_alignment, validate_platform_label, validate_redaction, DataClass,
-    PlatformError, PlatformResult, RedactionState, TraceContext,
+    PlatformError, PlatformResult, PlatformRights, RedactionState, TraceContext,
 };
 
 /// HAL metadata schema emitted by this crate version.
 pub const HAL_SCHEMA_VERSION: &str = "alani.platform.hal.v1";
-/// Maximum MMIO region length represented by this skeleton.
+/// Maximum MMIO region length represented by this crate version.
 pub const MAX_MMIO_REGION_LEN: u64 = 1 << 40;
+/// Maximum DMA window length represented by this crate version.
+pub const MAX_DMA_WINDOW_LEN: u64 = 1 << 40;
 /// Maximum HAL or boot component label length.
 pub const MAX_HAL_LABEL_LEN: usize = 96;
 
@@ -129,6 +131,18 @@ pub enum CachePolicy {
     WriteThrough = 2,
     /// Write-back cached access.
     WriteBack = 3,
+}
+
+/// Direction of device DMA relative to system memory.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DmaDirection {
+    /// Device reads from memory.
+    ToDevice = 0,
+    /// Device writes to memory.
+    FromDevice = 1,
+    /// Device may both read and write memory.
+    Bidirectional = 2,
 }
 
 /// Deterministic boot phase.
@@ -314,6 +328,98 @@ impl<'a> MmioRegion<'a> {
     }
 }
 
+/// Bounded DMA memory window supplied to platform or device code.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmaWindow<'a> {
+    /// Window label.
+    pub name: &'a str,
+    /// Physical start address.
+    pub physical_start: u64,
+    /// Window length in bytes.
+    pub length: u64,
+    /// Maximum single transfer length in bytes.
+    pub max_transfer_len: u64,
+    /// DMA direction relative to system memory.
+    pub direction: DmaDirection,
+    /// Whether the backing memory is pinned for the transfer lifetime.
+    pub pinned: bool,
+    /// Whether an IOMMU-like mapping constrains the device view.
+    pub iommu_mapped: bool,
+    /// Window metadata classification.
+    pub data_class: DataClass,
+    /// Window metadata redaction state.
+    pub redaction: RedactionState,
+}
+
+impl<'a> DmaWindow<'a> {
+    /// Creates a bounded DMA window.
+    pub const fn new(
+        name: &'a str,
+        physical_start: u64,
+        length: u64,
+        direction: DmaDirection,
+    ) -> Self {
+        Self {
+            name,
+            physical_start,
+            length,
+            max_transfer_len: length,
+            direction,
+            pinned: true,
+            iommu_mapped: false,
+            data_class: DataClass::Operational,
+            redaction: RedactionState::Operational,
+        }
+    }
+
+    /// Sets maximum single transfer length.
+    pub const fn with_max_transfer_len(mut self, max_transfer_len: u64) -> Self {
+        self.max_transfer_len = max_transfer_len;
+        self
+    }
+
+    /// Marks whether memory is pinned for the transfer lifetime.
+    pub const fn pinned(mut self, pinned: bool) -> Self {
+        self.pinned = pinned;
+        self
+    }
+
+    /// Marks whether an IOMMU-like mapping constrains the device view.
+    pub const fn iommu_mapped(mut self, iommu_mapped: bool) -> Self {
+        self.iommu_mapped = iommu_mapped;
+        self
+    }
+
+    /// Sets classification and redaction state.
+    pub const fn classified(mut self, data_class: DataClass, redaction: RedactionState) -> Self {
+        self.data_class = data_class;
+        self.redaction = redaction;
+        self
+    }
+
+    /// Validates DMA metadata.
+    pub fn validate(self) -> PlatformResult<()> {
+        validate_platform_label(self.name, MAX_HAL_LABEL_LEN)?;
+        if self.length == 0
+            || self.length > MAX_DMA_WINDOW_LEN
+            || self.max_transfer_len == 0
+            || self.max_transfer_len > self.length
+        {
+            return Err(PlatformError::InvalidHal);
+        }
+        validate_alignment(self.physical_start, 4096)?;
+        validate_alignment(self.length, 4096)?;
+        if !self.pinned {
+            return Err(PlatformError::InvalidState);
+        }
+        if matches!(self.data_class, DataClass::Secret) && !self.iommu_mapped {
+            return Err(PlatformError::UnsafeReviewRequired);
+        }
+        validate_redaction(self.data_class, self.redaction)
+    }
+}
+
 /// Single boot sequencing step.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -365,5 +471,135 @@ impl<'a> BootStep<'a> {
     pub fn validate(self) -> PlatformResult<()> {
         validate_platform_label(self.component, MAX_HAL_LABEL_LEN)?;
         self.trace.validate()
+    }
+}
+
+/// Fixed-capacity deterministic boot plan or boot log.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BootPlan<'a, const N: usize> {
+    steps: [Option<BootStep<'a>>; N],
+    len: usize,
+    sealed: bool,
+}
+
+impl<'a, const N: usize> BootPlan<'a, N> {
+    /// Creates an empty boot plan.
+    pub const fn new() -> Self {
+        Self {
+            steps: [None; N],
+            len: 0,
+            sealed: false,
+        }
+    }
+
+    /// Returns plan capacity.
+    pub const fn capacity(&self) -> usize {
+        N
+    }
+
+    /// Returns step count.
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` when no steps are present.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns `true` when the plan has been sealed.
+    pub const fn is_sealed(&self) -> bool {
+        self.sealed
+    }
+
+    /// Returns boot step slots.
+    pub const fn steps(&self) -> &[Option<BootStep<'a>>; N] {
+        &self.steps
+    }
+
+    /// Appends a completed boot step after authorization and ordering checks.
+    pub fn push(&mut self, rights: PlatformRights, step: BootStep<'a>) -> PlatformResult<()> {
+        rights.require(PlatformRights::CONFIGURE)?;
+        if self.sealed {
+            return Err(PlatformError::ReadOnly);
+        }
+        if step.requires_audit {
+            rights
+                .require(PlatformRights::AUDIT)
+                .map_err(|_| PlatformError::AuditRequired)?;
+        }
+        step.validate()?;
+        if !step.completed {
+            return Err(PlatformError::InvalidState);
+        }
+        if self.len >= N {
+            return Err(PlatformError::CapacityExceeded);
+        }
+        if self.len == 0 {
+            if step.phase != BootPhase::Reset {
+                return Err(PlatformError::InvalidState);
+            }
+        } else {
+            let previous = self.steps[self.len - 1].ok_or(PlatformError::Internal)?;
+            if !previous.phase.can_transition_to(step.phase) {
+                return Err(PlatformError::InvalidState);
+            }
+        }
+        self.steps[self.len] = Some(step);
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Seals the boot plan after validating a terminal phase.
+    pub fn seal(&mut self, rights: PlatformRights) -> PlatformResult<()> {
+        rights.require(PlatformRights::CONFIGURE)?;
+        self.validate()?;
+        let last = self.steps[self.len - 1].ok_or(PlatformError::MissingField)?;
+        if !last.phase.is_terminal() {
+            return Err(PlatformError::InvalidState);
+        }
+        self.sealed = true;
+        Ok(())
+    }
+
+    /// Validates boot-plan ordering and step metadata.
+    pub fn validate(&self) -> PlatformResult<()> {
+        if self.len == 0 || self.len > N {
+            return Err(PlatformError::MissingField);
+        }
+        let mut count = 0;
+        let mut previous_phase: Option<BootPhase> = None;
+        let mut index = 0;
+        while index < N {
+            if let Some(step) = self.steps[index] {
+                step.validate()?;
+                if !step.completed {
+                    return Err(PlatformError::InvalidState);
+                }
+                if count == 0 {
+                    if step.phase != BootPhase::Reset {
+                        return Err(PlatformError::InvalidState);
+                    }
+                } else {
+                    let previous = previous_phase.ok_or(PlatformError::Internal)?;
+                    if !previous.can_transition_to(step.phase) {
+                        return Err(PlatformError::InvalidState);
+                    }
+                }
+                previous_phase = Some(step.phase);
+                count += 1;
+            }
+            index += 1;
+        }
+        if count != self.len {
+            return Err(PlatformError::InvalidHal);
+        }
+        Ok(())
+    }
+}
+
+impl<'a, const N: usize> Default for BootPlan<'a, N> {
+    fn default() -> Self {
+        Self::new()
     }
 }

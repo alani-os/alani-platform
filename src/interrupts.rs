@@ -7,11 +7,11 @@ use crate::{
 
 /// Interrupt metadata schema emitted by this crate version.
 pub const INTERRUPT_SCHEMA_VERSION: &str = "alani.platform.interrupts.v1";
-/// Maximum interrupt vectors represented by this skeleton.
+/// Maximum interrupt vectors represented by this crate version.
 pub const MAX_INTERRUPT_VECTORS: u16 = 256;
 /// Maximum interrupt label length.
 pub const MAX_INTERRUPT_NAME_LEN: usize = 96;
-/// Maximum external IRQ number represented by this skeleton.
+/// Maximum external IRQ number represented by this crate version.
 pub const MAX_IRQ_NUMBER: u32 = 4095;
 
 /// Binding is enabled.
@@ -327,6 +327,12 @@ impl InterruptEvent {
         self
     }
 
+    /// Marks whether non-trivial work was deferred out of interrupt context.
+    pub const fn deferred(mut self, deferred: bool) -> Self {
+        self.deferred = deferred;
+        self
+    }
+
     /// Sets trace context.
     pub const fn with_trace(mut self, trace: TraceContext) -> Self {
         self.trace = trace;
@@ -339,7 +345,7 @@ impl InterruptEvent {
         if self.irq > MAX_IRQ_NUMBER || self.counter == 0 {
             return Err(PlatformError::InvalidInterrupt);
         }
-        if !self.acknowledged {
+        if !self.acknowledged || !self.deferred {
             return Err(PlatformError::InvalidState);
         }
         self.trace.validate()

@@ -9,7 +9,7 @@ use crate::{
 pub const TIMER_SCHEMA_VERSION: &str = "alani.platform.timers.v1";
 /// Maximum timer label length.
 pub const MAX_TIMER_NAME_LEN: usize = 96;
-/// Maximum sane timer frequency represented by this skeleton.
+/// Maximum sane timer frequency represented by this crate version.
 pub const MAX_TIMER_FREQUENCY_HZ: u64 = 10_000_000_000;
 
 /// Timer supports monotonic snapshots.
@@ -319,7 +319,7 @@ impl TimerConfig {
     }
 }
 
-/// Timer device skeleton.
+/// Timer device contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimerDevice<'a> {
     /// Timer descriptor.
@@ -466,6 +466,67 @@ impl TimerSnapshot {
             return Err(PlatformError::InvalidTimer);
         }
         if self.drift_ppm < -1_000_000 || self.drift_ppm > 1_000_000 {
+            return Err(PlatformError::InvalidTimer);
+        }
+        self.trace.validate()
+    }
+}
+
+/// Timer and preemption counters exported for scheduling diagnostics.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimerCounters {
+    /// Timer expiry events delivered.
+    pub expirations: u64,
+    /// Expiry events that missed their requested deadline.
+    pub missed_deadlines: u64,
+    /// Context switches attributed to this timer source.
+    pub context_switches: u64,
+    /// Preemption events attributed to this timer source.
+    pub preemptions: u64,
+    /// Trace context.
+    pub trace: TraceContext,
+}
+
+impl TimerCounters {
+    /// Creates timer counters.
+    pub const fn new(expirations: u64) -> Self {
+        Self {
+            expirations,
+            missed_deadlines: 0,
+            context_switches: 0,
+            preemptions: 0,
+            trace: TraceContext::EMPTY,
+        }
+    }
+
+    /// Sets missed deadline count.
+    pub const fn with_missed_deadlines(mut self, missed_deadlines: u64) -> Self {
+        self.missed_deadlines = missed_deadlines;
+        self
+    }
+
+    /// Sets context switch count.
+    pub const fn with_context_switches(mut self, context_switches: u64) -> Self {
+        self.context_switches = context_switches;
+        self
+    }
+
+    /// Sets preemption count.
+    pub const fn with_preemptions(mut self, preemptions: u64) -> Self {
+        self.preemptions = preemptions;
+        self
+    }
+
+    /// Sets trace context.
+    pub const fn with_trace(mut self, trace: TraceContext) -> Self {
+        self.trace = trace;
+        self
+    }
+
+    /// Validates timer diagnostic counters.
+    pub fn validate(self) -> PlatformResult<()> {
+        if self.missed_deadlines > self.expirations || self.preemptions > self.context_switches {
             return Err(PlatformError::InvalidTimer);
         }
         self.trace.validate()

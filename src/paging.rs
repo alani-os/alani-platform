@@ -52,6 +52,21 @@ pub const PAGE_KNOWN_FLAGS: u64 = PAGE_FLAG_PRESENT
     | PAGE_FLAG_COW
     | PAGE_FLAG_SHARED;
 
+/// User buffer may be read by the kernel or device path.
+pub const USER_BUFFER_FLAG_READ: u32 = 1 << 0;
+/// User buffer may be written by the kernel or device path.
+pub const USER_BUFFER_FLAG_WRITE: u32 = 1 << 1;
+/// User buffer pages are pinned for the declared operation lifetime.
+pub const USER_BUFFER_FLAG_PINNED: u32 = 1 << 2;
+/// User buffer may be shared with another task or device endpoint.
+pub const USER_BUFFER_FLAG_SHARED: u32 = 1 << 3;
+
+/// All user-buffer flags known by this crate version.
+pub const USER_BUFFER_KNOWN_FLAGS: u32 = USER_BUFFER_FLAG_READ
+    | USER_BUFFER_FLAG_WRITE
+    | USER_BUFFER_FLAG_PINNED
+    | USER_BUFFER_FLAG_SHARED;
+
 /// Physical address wrapper.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -255,6 +270,266 @@ impl Default for PagingPolicy {
     fn default() -> Self {
         Self::DEFAULT
     }
+}
+
+/// User-buffer access flag bitmap.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UserBufferFlags(pub u32);
+
+impl UserBufferFlags {
+    /// No user-buffer access.
+    pub const NONE: Self = Self(0);
+    /// Read access.
+    pub const READ: Self = Self(USER_BUFFER_FLAG_READ);
+    /// Write access.
+    pub const WRITE: Self = Self(USER_BUFFER_FLAG_WRITE);
+    /// Pinned buffer.
+    pub const PINNED: Self = Self(USER_BUFFER_FLAG_PINNED);
+    /// Shared buffer.
+    pub const SHARED: Self = Self(USER_BUFFER_FLAG_SHARED);
+
+    /// Creates flags after rejecting reserved bits.
+    pub const fn from_bits(bits: u32) -> PlatformResult<Self> {
+        if bits & !USER_BUFFER_KNOWN_FLAGS != 0 {
+            Err(PlatformError::ReservedBits)
+        } else {
+            Ok(Self(bits))
+        }
+    }
+
+    /// Returns raw flag bits.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Returns `true` when all required flags are present.
+    pub const fn contains(self, required: Self) -> bool {
+        self.0 & required.0 == required.0
+    }
+
+    /// Combines two flag sets.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Validates reserved bits.
+    pub const fn validate(self) -> PlatformResult<()> {
+        if self.0 & !USER_BUFFER_KNOWN_FLAGS != 0 {
+            Err(PlatformError::ReservedBits)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// User virtual address range allowed for buffer access.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserAddressRange {
+    /// First allowed user virtual address.
+    pub start: VirtualAddress,
+    /// Range length in bytes.
+    pub length: u64,
+}
+
+impl UserAddressRange {
+    /// Creates an allowed user address range.
+    pub const fn new(start: VirtualAddress, length: u64) -> Self {
+        Self { start, length }
+    }
+
+    /// Returns the exclusive range end.
+    pub fn end(self) -> PlatformResult<u64> {
+        if self.length == 0 {
+            return Err(PlatformError::InvalidAddress);
+        }
+        self.start
+            .0
+            .checked_add(self.length)
+            .ok_or(PlatformError::InvalidAddress)
+    }
+
+    /// Validates the range under a paging descriptor.
+    pub fn validate(self, descriptor: PagingDescriptor<'_>) -> PlatformResult<()> {
+        descriptor.validate()?;
+        let end = self.end()?;
+        if end <= self.start.0 {
+            return Err(PlatformError::InvalidAddress);
+        }
+        let virtual_bits = descriptor.mode.virtual_address_bits();
+        self.start.validate(virtual_bits)?;
+        if virtual_bits < 64 && end > (1u64 << virtual_bits) {
+            return Err(PlatformError::InvalidAddress);
+        }
+        Ok(())
+    }
+
+    /// Returns `true` when the supplied buffer is fully inside the range.
+    pub fn contains_buffer(
+        self,
+        descriptor: PagingDescriptor<'_>,
+        buffer: UserBuffer,
+    ) -> PlatformResult<bool> {
+        self.validate(descriptor)?;
+        let range_end = self.end()?;
+        let buffer_end = buffer.end()?;
+        Ok(buffer.ptr >= self.start.0 && buffer_end <= range_end)
+    }
+}
+
+/// Stable user-buffer descriptor used by syscall, memory, and device boundaries.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserBuffer {
+    /// User virtual pointer.
+    pub ptr: u64,
+    /// Buffer length in bytes.
+    pub len: u64,
+    /// User-buffer access flags.
+    pub flags: u32,
+    /// Reserved for ABI-compatible expansion. Must be zero.
+    pub reserved: u32,
+}
+
+impl UserBuffer {
+    /// Creates a user-buffer descriptor.
+    pub const fn new(ptr: u64, len: u64, flags: UserBufferFlags) -> Self {
+        Self {
+            ptr,
+            len,
+            flags: flags.bits(),
+            reserved: 0,
+        }
+    }
+
+    /// Returns the exclusive buffer end.
+    pub fn end(self) -> PlatformResult<u64> {
+        if self.ptr == 0 || self.len == 0 {
+            return Err(PlatformError::InvalidAddress);
+        }
+        self.ptr
+            .checked_add(self.len)
+            .ok_or(PlatformError::InvalidAddress)
+    }
+
+    /// Validates buffer flags, reserved fields, and user-range containment.
+    pub fn validate(
+        self,
+        descriptor: PagingDescriptor<'_>,
+        allowed_range: UserAddressRange,
+        required: UserBufferFlags,
+    ) -> PlatformResult<()> {
+        if self.reserved != 0 {
+            return Err(PlatformError::ReservedBits);
+        }
+        let flags = UserBufferFlags::from_bits(self.flags)?;
+        flags.validate()?;
+        required.validate()?;
+        if !flags.contains(required) {
+            return Err(PlatformError::AccessDenied);
+        }
+        if !flags.contains(UserBufferFlags::READ) && !flags.contains(UserBufferFlags::WRITE) {
+            return Err(PlatformError::InvalidPaging);
+        }
+        self.end()?;
+        if !allowed_range.contains_buffer(descriptor, self)? {
+            return Err(PlatformError::InvalidAddress);
+        }
+        Ok(())
+    }
+}
+
+/// Memory diagnostics exported by frame allocators and paging code.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryStats {
+    /// Total physical frames known to the allocator.
+    pub total_frames: u64,
+    /// Free physical frames.
+    pub free_frames: u64,
+    /// Reserved physical frames.
+    pub reserved_frames: u64,
+    /// Mapped virtual pages tracked for diagnostics.
+    pub mapped_pages: u64,
+    /// Page size used by the frame accounting domain.
+    pub page_size: PageSize,
+    /// Failed allocation attempts observed by the allocator.
+    pub failed_allocations: u64,
+    /// Trace context.
+    pub trace: TraceContext,
+}
+
+impl MemoryStats {
+    /// Creates memory statistics.
+    pub const fn new(total_frames: u64, free_frames: u64, page_size: PageSize) -> Self {
+        Self {
+            total_frames,
+            free_frames,
+            reserved_frames: 0,
+            mapped_pages: 0,
+            page_size,
+            failed_allocations: 0,
+            trace: TraceContext::EMPTY,
+        }
+    }
+
+    /// Sets reserved frame count.
+    pub const fn with_reserved_frames(mut self, reserved_frames: u64) -> Self {
+        self.reserved_frames = reserved_frames;
+        self
+    }
+
+    /// Sets mapped page count.
+    pub const fn with_mapped_pages(mut self, mapped_pages: u64) -> Self {
+        self.mapped_pages = mapped_pages;
+        self
+    }
+
+    /// Sets failed allocation count.
+    pub const fn with_failed_allocations(mut self, failed_allocations: u64) -> Self {
+        self.failed_allocations = failed_allocations;
+        self
+    }
+
+    /// Sets trace context.
+    pub const fn with_trace(mut self, trace: TraceContext) -> Self {
+        self.trace = trace;
+        self
+    }
+
+    /// Returns frames not currently free or reserved.
+    pub fn allocated_frames(self) -> PlatformResult<u64> {
+        self.validate()?;
+        Ok(self.total_frames - self.free_frames - self.reserved_frames)
+    }
+
+    /// Validates diagnostic counters.
+    pub fn validate(self) -> PlatformResult<()> {
+        if self.total_frames == 0 {
+            return Err(PlatformError::InvalidPaging);
+        }
+        let unavailable = self
+            .free_frames
+            .checked_add(self.reserved_frames)
+            .ok_or(PlatformError::InvalidPaging)?;
+        if unavailable > self.total_frames {
+            return Err(PlatformError::InvalidPaging);
+        }
+        self.trace.validate()
+    }
+}
+
+/// Minimal physical-frame allocator contract.
+pub trait FrameAllocator {
+    /// Allocates one frame and returns its physical address.
+    fn allocate_frame(&mut self) -> PlatformResult<PhysicalAddress>;
+
+    /// Releases one frame by physical address.
+    fn deallocate_frame(&mut self, frame: PhysicalAddress) -> PlatformResult<()>;
+
+    /// Returns allocator diagnostics.
+    fn stats(&self) -> MemoryStats;
 }
 
 /// Paging descriptor.

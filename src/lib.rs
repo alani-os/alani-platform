@@ -22,10 +22,10 @@ pub use arch::{
     MAX_CPU_LABEL_LEN,
 };
 pub use hal::{
-    BootPhase, BootStep, CachePolicy, HalCapabilities, HalDescriptor, HardwareProfile, MmioRegion,
-    HAL_CAP_DMA, HAL_CAP_INTERRUPTS, HAL_CAP_MMIO, HAL_CAP_PAGING, HAL_CAP_POWER,
-    HAL_CAP_SERIAL_CONSOLE, HAL_CAP_SMP, HAL_CAP_TIMERS, HAL_KNOWN_CAPABILITIES,
-    HAL_SCHEMA_VERSION, MAX_MMIO_REGION_LEN,
+    BootPhase, BootPlan, BootStep, CachePolicy, DmaDirection, DmaWindow, HalCapabilities,
+    HalDescriptor, HardwareProfile, MmioRegion, HAL_CAP_DMA, HAL_CAP_INTERRUPTS, HAL_CAP_MMIO,
+    HAL_CAP_PAGING, HAL_CAP_POWER, HAL_CAP_SERIAL_CONSOLE, HAL_CAP_SMP, HAL_CAP_TIMERS,
+    HAL_KNOWN_CAPABILITIES, HAL_SCHEMA_VERSION, MAX_DMA_WINDOW_LEN, MAX_MMIO_REGION_LEN,
 };
 pub use interrupts::{
     InterruptBinding, InterruptControllerKind, InterruptDescriptor, InterruptEvent, InterruptFlags,
@@ -34,16 +34,18 @@ pub use interrupts::{
     INTERRUPT_KNOWN_FLAGS, INTERRUPT_SCHEMA_VERSION, MAX_INTERRUPT_NAME_LEN, MAX_INTERRUPT_VECTORS,
 };
 pub use paging::{
-    PageFlags, PageMapping, PageSize, PageTablePlan, PagingDescriptor, PagingMode, PagingPolicy,
-    PhysicalAddress, VirtualAddress, PAGE_FLAG_COW, PAGE_FLAG_DEVICE, PAGE_FLAG_EXECUTABLE,
-    PAGE_FLAG_GLOBAL, PAGE_FLAG_GUARD, PAGE_FLAG_NO_CACHE, PAGE_FLAG_PRESENT, PAGE_FLAG_SHARED,
-    PAGE_FLAG_USER, PAGE_FLAG_WRITABLE, PAGE_FLAG_WRITE_THROUGH, PAGE_KNOWN_FLAGS, PAGE_SIZE_1GIB,
-    PAGE_SIZE_2MIB, PAGE_SIZE_4KIB, PAGING_SCHEMA_VERSION,
+    FrameAllocator, MemoryStats, PageFlags, PageMapping, PageSize, PageTablePlan, PagingDescriptor,
+    PagingMode, PagingPolicy, PhysicalAddress, UserAddressRange, UserBuffer, UserBufferFlags,
+    VirtualAddress, PAGE_FLAG_COW, PAGE_FLAG_DEVICE, PAGE_FLAG_EXECUTABLE, PAGE_FLAG_GLOBAL,
+    PAGE_FLAG_GUARD, PAGE_FLAG_NO_CACHE, PAGE_FLAG_PRESENT, PAGE_FLAG_SHARED, PAGE_FLAG_USER,
+    PAGE_FLAG_WRITABLE, PAGE_FLAG_WRITE_THROUGH, PAGE_KNOWN_FLAGS, PAGE_SIZE_1GIB, PAGE_SIZE_2MIB,
+    PAGE_SIZE_4KIB, PAGING_SCHEMA_VERSION, USER_BUFFER_FLAG_PINNED, USER_BUFFER_FLAG_READ,
+    USER_BUFFER_FLAG_SHARED, USER_BUFFER_FLAG_WRITE, USER_BUFFER_KNOWN_FLAGS,
 };
 pub use timers::{
-    TimerCapabilities, TimerConfig, TimerDescriptor, TimerDevice, TimerKind, TimerMode,
-    TimerResolution, TimerSnapshot, TimerState, TIMER_CAP_APIC, TIMER_CAP_DEADLINE, TIMER_CAP_HPET,
-    TIMER_CAP_MONOTONIC, TIMER_CAP_PERIODIC, TIMER_CAP_RISCV_SBI, TIMER_CAP_TSC,
+    TimerCapabilities, TimerConfig, TimerCounters, TimerDescriptor, TimerDevice, TimerKind,
+    TimerMode, TimerResolution, TimerSnapshot, TimerState, TIMER_CAP_APIC, TIMER_CAP_DEADLINE,
+    TIMER_CAP_HPET, TIMER_CAP_MONOTONIC, TIMER_CAP_PERIODIC, TIMER_CAP_RISCV_SBI, TIMER_CAP_TSC,
     TIMER_CAP_WATCHDOG, TIMER_KNOWN_CAPABILITIES, TIMER_SCHEMA_VERSION,
 };
 
@@ -72,6 +74,8 @@ pub const PLATFORM_FEATURE_MMIO: u64 = 1 << 5;
 pub const PLATFORM_FEATURE_TRACE_CONTEXT: u64 = 1 << 6;
 /// Feature bit for host-mode simulated platform records.
 pub const PLATFORM_FEATURE_HOST_SIMULATION: u64 = 1 << 7;
+/// Feature bit for bounded DMA metadata.
+pub const PLATFORM_FEATURE_DMA: u64 = 1 << 8;
 
 /// All platform feature bits known by this crate version.
 pub const PLATFORM_KNOWN_FEATURES: u64 = PLATFORM_FEATURE_ARCH
@@ -81,7 +85,8 @@ pub const PLATFORM_KNOWN_FEATURES: u64 = PLATFORM_FEATURE_ARCH
     | PLATFORM_FEATURE_PAGING
     | PLATFORM_FEATURE_MMIO
     | PLATFORM_FEATURE_TRACE_CONTEXT
-    | PLATFORM_FEATURE_HOST_SIMULATION;
+    | PLATFORM_FEATURE_HOST_SIMULATION
+    | PLATFORM_FEATURE_DMA;
 
 /// Caller may read platform metadata.
 pub const PLATFORM_RIGHT_READ: u64 = 1 << 0;
@@ -418,7 +423,7 @@ impl PlatformRights {
 /// Implementation maturity marker for generated repository metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComponentStatus {
-    /// API is present as a draft skeleton.
+    /// API is present as a draft interface.
     Draft,
     /// API is implemented enough for host-mode experimentation.
     Experimental,
